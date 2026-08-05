@@ -76,28 +76,62 @@ class DesktopExportApi:
                 file_types=_FILE_FILTERS[suffix],
             )
         except Exception as exc:
-            message = f"打开保存对话框失败：{exc}"
             _LOGGER.exception("Failed to open native save dialog")
-            return {"status": "error", "message": message}
+            return {"status": "error", "message": "打开保存对话框失败，请重试"}
 
         # pywebview returns None when the dialog is cancelled; some platforms
         # return an empty tuple instead.
         if not selected:
             return {"status": "cancelled", "message": "已取消保存"}
 
-        if isinstance(selected, (tuple, list)):
-            target = Path(selected[0])
-        else:
-            target = Path(selected)
+        target = self._normalize_target(selected, source)
+        if isinstance(target, dict):
+            return target
 
         try:
+            # Selecting the export file itself is a no-op, not an error.
+            if target.resolve() == source.resolve():
+                return {"status": "saved", "path": str(target), "message": "文件已保存"}
             shutil.copy2(source, target)
-        except Exception as exc:
-            message = f"保存失败：{exc}"
+        except PermissionError:
+            _LOGGER.exception("Permission denied while copying export file")
+            return {"status": "error", "message": "保存失败：没有权限写入目标位置"}
+        except OSError:
+            _LOGGER.exception("OSError while copying export file")
+            return {
+                "status": "error",
+                "message": "保存失败：无法复制文件，请检查磁盘空间或文件是否被占用",
+            }
+        except Exception:
             _LOGGER.exception("Failed to copy export file")
-            return {"status": "error", "message": message}
+            return {"status": "error", "message": "保存失败：无法复制导出文件"}
 
         return {"status": "saved", "path": str(target), "message": "文件已保存"}
+
+    def _normalize_target(self, selected: Any, source: Path) -> Path | dict:
+        """Convert the dialog result into a safe target path, or an error dict."""
+        if isinstance(selected, (tuple, list)):
+            if not selected:
+                return {"status": "cancelled", "message": "已取消保存"}
+            raw = selected[0]
+        else:
+            raw = selected
+
+        if not isinstance(raw, str) or not raw.strip():
+            return {"status": "error", "message": "保存失败：保存路径无效"}
+
+        target = Path(raw.strip())
+        if target.exists() and target.is_dir():
+            return {"status": "error", "message": "保存失败：目标位置无效，请选择文件路径"}
+
+        # The native dialog usually appends the selected filter's extension, but
+        # explicitly complete it when the user typed a name without one.
+        if target.suffix.lower() not in _ALLOWED_SUFFIXES and source.suffix:
+            target = Path(f"{target}{source.suffix}")
+
+        if not str(target).strip() or target == Path("."):
+            return {"status": "error", "message": "保存失败：保存路径无效"}
+        return target
 
     def _resolve_source(self, file_name: str) -> Path:
         """Validate ``file_name`` and return the resolved source file path."""

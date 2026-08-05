@@ -68,6 +68,17 @@ _export_state = {
     "message": "",
 }
 
+_ALLOWED_EXPORT_SUFFIXES = (".json", ".jsonl", ".zip")
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
 # ── Scheduler state ──
 _scheduler_state = {
     "enabled": False,
@@ -905,12 +916,33 @@ async def start_export(req: ExportRequest):
 
     convs = list(req.conversations) if req.conversations else None
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _do_export, fmt, req.filter, convs)
+    try:
+        await loop.run_in_executor(None, _do_export, fmt, req.filter, convs)
+    except Exception as e:
+        # _do_export normally reports failures itself; this guard only covers
+        # unexpected executor-level errors so status never sticks at running.
+        _export_state["status"] = "failed"
+        _export_state["file_path"] = None
+        _export_state["message"] = f"导出失败: {e}"
     return {
         "status": _export_state["status"],
         "message": _export_state["message"],
         "file_path": _export_state["file_path"],
     }
+
+
+def _unique_zip_arcname(safe: str, ext: str, used: set[str]) -> str:
+    """Return a collision-free ZIP entry name for a sanitized conversation name."""
+    base = safe
+    if base.upper() in _WINDOWS_RESERVED_NAMES:
+        base = f"_{base}"
+    arcname = f"{base}{ext}"
+    counter = 2
+    while arcname in used:
+        arcname = f"{base}_{counter}{ext}"
+        counter += 1
+    used.add(arcname)
+    return arcname
 
 
 def _do_export(fmt: str, filter_name: str, conversations: list | None):
@@ -951,6 +983,13 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
             # Multiple → bundle into a zip
             tmp_dir = data_dir / "export_tmp"
             os.makedirs(tmp_dir, exist_ok=True)
+            zip_path = data_dir / "export.zip"
+            # Remove a stale bundle so it can never be mistaken for a new export.
+            if os.path.exists(zip_path):
+                try:
+                    os.remove(zip_path)
+                except Exception:
+                    pass
             # Clear old tmp files
             for fn in os.listdir(tmp_dir):
                 try:
@@ -959,23 +998,26 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
                     pass
 
             produced = []
+            used_arcnames: set[str] = set()
             for name in targets:
-                safe = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", name)[:80] or "conv"
-                path = tmp_dir / f"{safe}{ext}"
+                safe = re.sub(
+                    r"[^\w\u4e00-\u9fff.-]+", "_", str(name or "")
+                )[:80] or "conv"
+                arcname = _unique_zip_arcname(safe, ext, used_arcnames)
+                path = tmp_dir / arcname
                 try:
                     ChatLabExporter(conv_name=name, output_format=fmt).export(path)
                     if os.path.exists(path):
-                        produced.append((name, path))
+                        produced.append((name, path, arcname))
                 except Exception as e:
                     print(f"[-] 导出 {name} 失败: {e}")
 
             if not produced:
                 raise RuntimeError("没有成功导出的会话")
 
-            zip_path = data_dir / "export.zip"
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-                for _, path in produced:
-                    zf.write(path, arcname=Path(path).name)
+                for _, path, arcname in produced:
+                    zf.write(path, arcname=arcname)
 
             _export_state["file_path"] = "export.zip"
             size_mb = os.path.getsize(zip_path) / (1024 * 1024)
@@ -993,6 +1035,13 @@ async def download_export():
     rel_name = _export_state.get("file_path")
     if not rel_name:
         return JSONResponse({"error": "No export file"}, status_code=404)
+
+    candidate = Path(rel_name)
+    if (
+        candidate.name != rel_name
+        or candidate.suffix.lower() not in _ALLOWED_EXPORT_SUFFIXES
+    ):
+        return JSONResponse({"error": "File not found"}, status_code=404)
 
     data_dir = Path(paths.DATA_DIR).resolve()
     path = (data_dir / rel_name).resolve()

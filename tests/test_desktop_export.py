@@ -6,7 +6,7 @@ import sys
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -192,6 +192,135 @@ def test_window_not_bound_returns_clear_error(export_api):
     assert "Traceback" not in result["message"]
 
 
+def test_save_dialog_empty_list_cancelled(export_api):
+    _write_source(export_api, "export.json")
+    export_api.bind_window(_make_window([]))
+
+    with patch.dict(sys.modules, {"webview": _FakeWebView}):
+        result = export_api.save_export("export.json")
+
+    assert result == {"status": "cancelled", "message": "已取消保存"}
+
+
+def test_save_dialog_single_element_tuple(tmp_path, export_api):
+    source = _write_source(export_api, "export.json")
+    target = tmp_path / "single.json"
+    export_api.bind_window(_make_window((str(target),)))
+
+    with patch.dict(sys.modules, {"webview": _FakeWebView}):
+        result = export_api.save_export("export.json")
+
+    assert result["status"] == "saved"
+    assert result["path"] == str(target)
+    assert target.read_bytes() == source.read_bytes()
+
+
+def test_save_dialog_string(tmp_path, export_api):
+    _write_source(export_api, "export.zip", b"PK\x03\x04")
+    target = tmp_path / "string-result.zip"
+    export_api.bind_window(_make_window(str(target)))
+
+    with patch.dict(sys.modules, {"webview": _FakeWebView}):
+        result = export_api.save_export("export.zip")
+
+    assert result["status"] == "saved"
+    assert target.read_bytes() == b"PK\x03\x04"
+
+
+def test_save_target_same_as_source(export_api):
+    source = _write_source(export_api, "export.json", b"same")
+    export_api.bind_window(_make_window(str(source)))
+    copy2 = MagicMock()
+
+    with (
+        patch("desktop.export_api.shutil.copy2", copy2),
+        patch.dict(sys.modules, {"webview": _FakeWebView}),
+    ):
+        result = export_api.save_export("export.json")
+
+    assert result == {"status": "saved", "path": str(source), "message": "文件已保存"}
+    copy2.assert_not_called()
+    assert source.read_bytes() == b"same"
+
+
+def test_save_target_without_extension_appends_source_suffix(tmp_path, export_api):
+    _write_source(export_api, "export.json", b'{"ok": true}')
+    target_no_ext = tmp_path / "导出 记录" / "聊天记录"
+    target_no_ext.parent.mkdir()
+    export_api.bind_window(_make_window(str(target_no_ext)))
+
+    with patch.dict(sys.modules, {"webview": _FakeWebView}):
+        result = export_api.save_export("export.json")
+
+    assert result["status"] == "saved"
+    expected = tmp_path / "导出 记录" / "聊天记录.json"
+    assert result["path"] == str(expected)
+    assert expected.read_bytes() == b'{"ok": true}'
+
+
+def test_save_chinese_and_space_path(tmp_path, export_api):
+    _write_source(export_api, "export.jsonl", '{"a":1}\n'.encode("utf-8"))
+    target = tmp_path / "中文 目录" / "聊天记录 export.jsonl"
+    target.parent.mkdir()
+    export_api.bind_window(_make_window(str(target)))
+
+    with patch.dict(sys.modules, {"webview": _FakeWebView}):
+        result = export_api.save_export("export.jsonl")
+
+    assert result["status"] == "saved"
+    assert target.read_bytes() == '{"a":1}\n'.encode("utf-8")
+
+
+def test_copy_permission_error_returns_readable_message(tmp_path, export_api):
+    _write_source(export_api, "export.json")
+    export_api.bind_window(_make_window(str(tmp_path / "target.json")))
+
+    with (
+        patch(
+            "desktop.export_api.shutil.copy2",
+            side_effect=PermissionError(13, "Permission denied"),
+        ),
+        patch.dict(sys.modules, {"webview": _FakeWebView}),
+    ):
+        result = export_api.save_export("export.json")
+
+    assert result["status"] == "error"
+    assert result["message"] == "保存失败：没有权限写入目标位置"
+    assert "Traceback" not in result["message"]
+
+
+def test_target_empty_string_tuple_rejected(export_api):
+    _write_source(export_api, "export.json")
+    export_api.bind_window(_make_window(("",)))
+    copy2 = MagicMock()
+
+    with (
+        patch("desktop.export_api.shutil.copy2", copy2),
+        patch.dict(sys.modules, {"webview": _FakeWebView}),
+    ):
+        result = export_api.save_export("export.json")
+
+    assert result["status"] == "error"
+    assert "保存路径无效" in result["message"]
+    copy2.assert_not_called()
+
+
+def test_target_directory_rejected(export_api, data_dir):
+    _write_source(export_api, "export.json")
+    export_api.bind_window(_make_window(str(data_dir)))
+    copy2 = MagicMock()
+
+    with (
+        patch("desktop.export_api.shutil.copy2", copy2),
+        patch.dict(sys.modules, {"webview": _FakeWebView}),
+    ):
+        result = export_api.save_export("export.json")
+
+    assert result["status"] == "error"
+    assert "目标位置无效" in result["message"]
+    copy2.assert_not_called()
+
+
 def test_error_results_never_contain_traceback(export_api):
     results = [
         export_api.save_export(""),
@@ -305,6 +434,79 @@ def test_download_serves_valid_export_file(client, monkeypatch, tmp_path):
     assert response.content == b"{}"
 
 
+def test_download_rejects_absolute_path(client, monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    control_panel._export_state.update(
+        {"status": "completed", "file_path": str(tmp_path / "secret.json"), "message": "ok"}
+    )
+
+    assert client.get("/panel/api/export/download").status_code == 404
+
+
+def test_download_rejects_subdirectory_path(client, monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    sub = data_dir / "sub"
+    sub.mkdir(parents=True)
+    (sub / "export.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    control_panel._export_state.update(
+        {"status": "completed", "file_path": "sub/export.json", "message": "ok"}
+    )
+
+    assert client.get("/panel/api/export/download").status_code == 404
+
+
+def test_download_rejects_unsupported_extension(client, monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    (data_dir / "export.txt").write_text("x", encoding="utf-8")
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    control_panel._export_state.update(
+        {"status": "completed", "file_path": "export.txt", "message": "ok"}
+    )
+
+    assert client.get("/panel/api/export/download").status_code == 404
+
+
+def test_concurrent_export_returns_409(client):
+    control_panel._export_state.update(
+        {"status": "running", "file_path": None, "message": "正在导出..."}
+    )
+    response = client.post("/panel/api/export", json={"format": "jsonl"})
+    assert response.status_code == 409
+
+
+def test_export_executor_failure_does_not_stick_running(client, monkeypatch, tmp_path):
+    monkeypatch.setattr(paths, "CONFIG_PATH", str(tmp_path / "panel_config.json"))
+
+    def boom(fmt, filter_name, conversations):
+        raise RuntimeError("executor boom")
+
+    monkeypatch.setattr(control_panel, "_do_export", boom)
+    response = client.post("/panel/api/export", json={"format": "json"})
+
+    assert response.status_code == 200
+    assert control_panel._export_state["status"] == "failed"
+    assert control_panel._export_state["file_path"] is None
+
+
+def test_panel_save_recovery_uses_finally_and_guards_repeat_click():
+    html = control_panel.PANEL_HTML
+    assert "btn.disabled = true;" in html
+    assert "} finally {" in html
+    assert "btn.disabled = false;" in html
+    assert "if (btn.disabled) {" in html
+
+
+def test_panel_web_mode_keeps_http_download_without_pywebview():
+    html = control_panel.PANEL_HTML
+    assert "if (!isDesktopSaveAvailable()) {" in html
+    assert "return true; // plain browser/Docker flow keeps the normal download link" in html
+    assert 'href="/panel/api/export/download"' in html
+
+
 class _FakeChatLabExporter:
     def __init__(self, **kwargs):
         pass
@@ -337,3 +539,39 @@ def test_multi_export_returns_zip_file_name(monkeypatch, tmp_path):
     assert zip_path.is_file()
     with zipfile.ZipFile(zip_path) as zf:
         assert len(zf.namelist()) == 2
+
+
+def test_multi_export_avoids_colliding_arcnames(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+
+    control_panel._do_export("jsonl", "", ["A/B", "A\\B", "A B", "CON", "", ""])
+
+    assert control_panel._export_state["status"] == "completed"
+    zip_path = data_dir / "export.zip"
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    assert len(names) == len(set(names))
+    assert "A_B.jsonl" in names
+    assert "A_B_2.jsonl" in names
+    assert "A_B_3.jsonl" in names
+    assert "_CON.jsonl" in names
+    assert "conv.jsonl" in names
+    assert "conv_2.jsonl" in names
+
+
+def test_multi_export_zip_entries_are_relative_basenames(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+
+    control_panel._do_export("json", "", ["会话A", "会话B"])
+
+    zip_path = data_dir / "export.zip"
+    with zipfile.ZipFile(zip_path) as zf:
+        for name in zf.namelist():
+            assert not Path(name).is_absolute()
+            assert ".." not in name
+            assert "/" not in name
+            assert "\\" not in name

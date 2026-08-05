@@ -1193,6 +1193,10 @@ function downloadExport(event) {
     return true; // plain browser/Docker flow keeps the normal download link
   }
   event.preventDefault();
+  const btn = document.getElementById('downloadBtn');
+  if (btn.disabled) {
+    return false; // a save is already in progress; ignore repeated clicks
+  }
   performDesktopSave();
   return false;
 }
