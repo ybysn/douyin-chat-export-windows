@@ -467,8 +467,9 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
         <option value="json">JSON</option>
       </select>
       <button class="btn btn-primary" id="exportBtn" onclick="startExport()" data-i18n="exportBtn">导出</button>
-      <a class="btn btn-success" id="downloadBtn" style="display:none;text-decoration:none" href="/panel/api/export/download" data-i18n="download">下载</a>
+      <a class="btn btn-success" id="downloadBtn" style="display:none;text-decoration:none" href="/panel/api/export/download" onclick="return downloadExport(event)" data-i18n="download">下载</a>
     </div>
+    <div class="meta" id="exportSaveMsg" style="margin-top:6px"></div>
     <div class="conv-list-toolbar" style="margin-top:10px;">
       <span data-i18n="selectConvsLabel">选择会话:</span>
       <a href="#" onclick="selectAllConvs('export',true);return false;" data-i18n="selectAll">全选</a>
@@ -614,6 +615,11 @@ const T = {
     exportTitle: '导出',
     exportBtn: '导出',
     download: '下载',
+    saveExporting: '正在保存...',
+    saveExportSuccess: (path) => '文件已保存：' + path,
+    saveExportCancelled: '已取消保存',
+    saveExportFailed: (msg) => '保存失败：' + msg,
+    saveExportUnknownError: '未知错误',
     passwordTitle: '密码',
     passwordDesc: '设置密码以保护聊天查看器和控制面板。',
     enterPassword: '输入密码',
@@ -711,6 +717,11 @@ const T = {
     exportTitle: 'Export',
     exportBtn: 'Export',
     download: 'Download',
+    saveExporting: 'Saving...',
+    saveExportSuccess: (path) => 'File saved: ' + path,
+    saveExportCancelled: 'Save cancelled',
+    saveExportFailed: (msg) => 'Save failed: ' + msg,
+    saveExportUnknownError: 'Unknown error',
     passwordTitle: 'Password',
     passwordDesc: 'Set a password to protect the chat viewer and panel.',
     enterPassword: 'Enter password',
@@ -835,6 +846,7 @@ let selectedMap = {           // section -> Set of nicknames
 };
 let lastDiscoverStatus = 'idle';
 let lastDiscoverMsg = '';
+let currentExportFileName = null;
 
 async function loadStatus() {
   try {
@@ -866,6 +878,7 @@ async function loadStatus() {
     setStatusEl(ee, es.status);
     document.getElementById('exportBtn').disabled = es.status === 'running';
     document.getElementById('exportMsg').textContent = es.message || '';
+    currentExportFileName = es.file_path || null;
     document.getElementById('downloadBtn').style.display = (es.status === 'completed' && es.file_path) ? '' : 'none';
 
     // Schedule status
@@ -1156,12 +1169,68 @@ async function startExport() {
   }
   document.getElementById('exportBtn').disabled = true;
   setStatusEl(document.getElementById('exportStatus'), 'running');
+  setDynText(document.getElementById('exportSaveMsg'), '');
+  currentExportFileName = null;
   await fetch('/panel/api/export', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({ format, conversations }),
   });
   loadStatus();
+}
+
+/* ── Desktop export save (PyWebView native Save As) ── */
+function isDesktopSaveAvailable() {
+  return !!(
+    window.pywebview &&
+    window.pywebview.api &&
+    typeof window.pywebview.api.save_export === 'function'
+  );
+}
+
+function downloadExport(event) {
+  if (!isDesktopSaveAvailable()) {
+    return true; // plain browser/Docker flow keeps the normal download link
+  }
+  event.preventDefault();
+  performDesktopSave();
+  return false;
+}
+
+async function performDesktopSave() {
+  const btn = document.getElementById('downloadBtn');
+  const msgEl = document.getElementById('exportSaveMsg');
+  const fileName = currentExportFileName;
+  if (!fileName) {
+    setDynText(msgEl, t('saveExportFailed', t('saveExportUnknownError')));
+    return;
+  }
+
+  btn.disabled = true;
+  setDynText(msgEl, t('saveExporting'));
+  try {
+    const result = await window.pywebview.api.save_export(fileName);
+    if (!result || typeof result !== 'object' || typeof result.status !== 'string') {
+      setDynText(msgEl, t('saveExportFailed', t('saveExportUnknownError')));
+      return;
+    }
+    if (result.status === 'saved') {
+      const savedPath = typeof result.path === 'string' ? result.path : fileName;
+      setDynText(msgEl, t('saveExportSuccess', savedPath));
+    } else if (result.status === 'cancelled') {
+      setDynText(msgEl, t('saveExportCancelled'));
+    } else {
+      const reason = (typeof result.message === 'string' && result.message)
+        ? result.message
+        : t('saveExportUnknownError');
+      setDynText(msgEl, t('saveExportFailed', reason));
+    }
+  } catch (e) {
+    const detail = e && e.message ? e.message : String(e);
+    setDynText(msgEl, t('saveExportFailed', detail));
+  } finally {
+    btn.disabled = false;
+  }
 }
 
 /* ── Media download ── */

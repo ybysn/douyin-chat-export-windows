@@ -4,6 +4,7 @@ import json
 import os
 import sys
 import time
+from pathlib import Path
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse
@@ -883,8 +884,18 @@ async def start_export(req: ExportRequest):
     if _export_state["status"] == "running":
         return JSONResponse({"error": "Export already running"}, status_code=409)
 
+    fmt = (req.format or "").strip().lower()
+    if fmt not in ("json", "jsonl"):
+        return JSONResponse(
+            {"error": "不支持的导出格式，仅支持 json 或 jsonl"},
+            status_code=400,
+        )
+
+    # Clear stale success state up front so a previous export's download can
+    # never survive into a new run or a failed run.
     _export_state["status"] = "running"
     _export_state["message"] = "正在导出..."
+    _export_state["file_path"] = None
 
     # Persist selection
     if req.conversations is not None:
@@ -894,7 +905,7 @@ async def start_export(req: ExportRequest):
 
     convs = list(req.conversations) if req.conversations else None
     loop = asyncio.get_event_loop()
-    await loop.run_in_executor(None, _do_export, req.format, req.filter, convs)
+    await loop.run_in_executor(None, _do_export, fmt, req.filter, convs)
     return {
         "status": _export_state["status"],
         "message": _export_state["message"],
@@ -909,7 +920,8 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
         import zipfile
 
         ext = ".json" if fmt == "json" else ".jsonl"
-        data_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data")
+        data_dir = Path(paths.DATA_DIR)
+        data_dir.mkdir(parents=True, exist_ok=True)
 
         # Decide targets
         if conversations:
@@ -921,7 +933,7 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
 
         if len(targets) <= 1:
             # Single file
-            output_path = os.path.join(data_dir, f"export{ext}")
+            output_path = data_dir / f"export{ext}"
             # Remove stale file so a "conv not found" early-return doesn't look like success
             if os.path.exists(output_path):
                 try:
@@ -937,19 +949,19 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
             _export_state["message"] = f"导出完成 ({size_mb:.1f} MB)"
         else:
             # Multiple → bundle into a zip
-            tmp_dir = os.path.join(data_dir, "export_tmp")
+            tmp_dir = data_dir / "export_tmp"
             os.makedirs(tmp_dir, exist_ok=True)
             # Clear old tmp files
             for fn in os.listdir(tmp_dir):
                 try:
-                    os.remove(os.path.join(tmp_dir, fn))
+                    os.remove(tmp_dir / fn)
                 except Exception:
                     pass
 
             produced = []
             for name in targets:
                 safe = re.sub(r"[^\w\u4e00-\u9fff.-]+", "_", name)[:80] or "conv"
-                path = os.path.join(tmp_dir, f"{safe}{ext}")
+                path = tmp_dir / f"{safe}{ext}"
                 try:
                     ChatLabExporter(conv_name=name, output_format=fmt).export(path)
                     if os.path.exists(path):
@@ -960,10 +972,10 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
             if not produced:
                 raise RuntimeError("没有成功导出的会话")
 
-            zip_path = os.path.join(data_dir, "export.zip")
+            zip_path = data_dir / "export.zip"
             with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
                 for _, path in produced:
-                    zf.write(path, arcname=os.path.basename(path))
+                    zf.write(path, arcname=Path(path).name)
 
             _export_state["file_path"] = "export.zip"
             size_mb = os.path.getsize(zip_path) / (1024 * 1024)
@@ -972,19 +984,22 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
         _export_state["status"] = "completed"
     except Exception as e:
         _export_state["status"] = "failed"
+        _export_state["file_path"] = None
         _export_state["message"] = f"导出失败: {e}"
 
 
 @control_router.get("/api/export/download")
 async def download_export():
-    if not _export_state["file_path"]:
+    rel_name = _export_state.get("file_path")
+    if not rel_name:
         return JSONResponse({"error": "No export file"}, status_code=404)
-    path = os.path.join(
-        os.path.dirname(os.path.dirname(__file__)), "data", _export_state["file_path"]
-    )
-    if not os.path.exists(path):
+
+    data_dir = Path(paths.DATA_DIR).resolve()
+    path = (data_dir / rel_name).resolve()
+    # Never allow a poisoned file_path to escape the data directory.
+    if not path.is_relative_to(data_dir) or not path.is_file():
         return JSONResponse({"error": "File not found"}, status_code=404)
-    return FileResponse(path, filename=_export_state["file_path"])
+    return FileResponse(path, filename=path.name)
 
 
 # ── Login (in-container headless with screenshot) ──

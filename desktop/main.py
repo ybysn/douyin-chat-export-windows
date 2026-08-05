@@ -19,6 +19,7 @@ from desktop.launcher import (
     is_frozen,
     resource_dir,
 )
+from desktop.export_api import DesktopExportApi
 
 _LOG_FILE_NAME = "desktop.log"
 
@@ -127,6 +128,9 @@ def run_desktop() -> int:
         server.start()
         logging.info("Stage: local server is ready")
 
+        logging.info("Stage: creating desktop export API")
+        desktop_export_api = DesktopExportApi()
+
         logging.info("Stage: importing pywebview")
         import webview
 
@@ -139,11 +143,13 @@ def run_desktop() -> int:
         window = webview.create_window(
             APP_TITLE,
             f"{server.base_url}/panel",
+            js_api=desktop_export_api,
             width=1280,
             height=820,
             min_size=(980, 680),
             text_select=True,
         )
+        desktop_export_api.bind_window(window)
         window.events.closed += server.stop
 
         logging.info("Stage: entering PyWebView event loop")
