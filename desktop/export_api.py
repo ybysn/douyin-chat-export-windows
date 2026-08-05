@@ -17,8 +17,6 @@ import shutil
 from pathlib import Path
 from typing import Any
 
-from common import paths
-
 _ALLOWED_SUFFIXES = (".json", ".jsonl", ".zip")
 
 _FILE_FILTERS = {
@@ -34,9 +32,10 @@ class DesktopExportApi:
     """Single-purpose JS API for saving completed exports to a user-chosen path."""
 
     def __init__(self, data_dir: str | os.PathLike | None = None) -> None:
-        self._data_dir = Path(
-            data_dir if data_dir is not None else paths.DATA_DIR
-        ).resolve()
+        # Resolve lazily: in frozen builds common.paths must not be imported
+        # before configure_environment() sets DOUYIN_CHAT_DATA_DIR, otherwise
+        # the whole app would resolve its data root inside the bundle.
+        self._data_dir = Path(data_dir).resolve() if data_dir is not None else None
         self._window: Any | None = None
 
     def bind_window(self, window: Any) -> None:
@@ -153,10 +152,17 @@ class DesktopExportApi:
         if suffix not in _ALLOWED_SUFFIXES:
             raise ValueError("保存失败：仅支持 .json、.jsonl 和 .zip 导出文件")
 
-        data_dir = self._data_dir
+        data_dir = self._resolve_data_dir()
         source = (data_dir / name).resolve()
         if not source.is_relative_to(data_dir):
             raise ValueError("保存失败：导出文件不在数据目录内")
         if not source.is_file():
             raise ValueError("保存失败：导出文件不存在")
         return source
+
+    def _resolve_data_dir(self) -> Path:
+        if self._data_dir is None:
+            from common import paths
+
+            self._data_dir = Path(paths.DATA_DIR).resolve()
+        return self._data_dir

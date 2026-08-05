@@ -1,5 +1,6 @@
 """Unit tests for desktop-only argument and path helpers."""
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -91,6 +92,48 @@ class DesktopBootstrapTests(unittest.TestCase):
         bound_api = fake_webview.created_kwargs["js_api"]
         self.assertIs(bound_api._window, window)
         self.assertIn(server.stop, window.events.closed.handlers)
+
+    def test_importing_desktop_main_does_not_preload_common_paths(self):
+        # Regression: desktop/export_api.py used to import common.paths at
+        # module level. In a frozen build that resolved the data root before
+        # configure_environment() set DOUYIN_CHAT_DATA_DIR, so the app read its
+        # bundle-internal data directory instead of the user data directory.
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = (
+            "import sys;"
+            f"sys.path.insert(0, {repo_root!r});"
+            "import desktop.main;"
+            "print('common.paths' in sys.modules)"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=result.stderr,
+        )
+        self.assertEqual(result.stdout.strip(), "False")
+
+    def test_export_api_default_data_dir_reads_runtime_paths(self):
+        import common.paths as paths
+        from desktop.export_api import DesktopExportApi
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime_data = os.path.join(tmp, "runtime-data")
+            old_data_dir = paths.DATA_DIR
+            try:
+                paths.DATA_DIR = runtime_data
+                api = DesktopExportApi()
+                self.assertEqual(
+                    str(api._resolve_data_dir()),
+                    os.path.abspath(runtime_data),
+                )
+            finally:
+                paths.DATA_DIR = old_data_dir
 
 
 if __name__ == "__main__":
