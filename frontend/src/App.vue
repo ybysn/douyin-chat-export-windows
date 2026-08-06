@@ -141,6 +141,15 @@ function navigateToMessage(item) {
     <div class="app-main">
       <div class="app-toolbar">
         <button class="sidebar-toggle" @click="sidebarOpen = !sidebarOpen">☰</button>
+        <a
+          href="/panel"
+          class="panel-back-btn"
+          title="返回控制面板"
+          aria-label="返回控制面板"
+        >
+          <span aria-hidden="true">←</span>
+          <span class="panel-back-text">返回控制面板</span>
+        </a>
         <div class="app-title">抖音聊天记录</div>
         <SearchBar @navigate="navigateToMessage" />
         <div class="theme-switcher">
@@ -280,6 +289,40 @@ function navigateToMessage(item) {
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
+.panel-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 7px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  text-decoration: none;
+  font-size: 13px;
+  font-weight: 500;
+  transition:
+    color 0.15s,
+    border-color 0.15s,
+    background 0.15s;
+}
+
+.panel-back-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent);
+}
+
+.panel-back-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.panel-back-btn:active {
+  color: var(--accent);
+  background: var(--bg-secondary);
+}
+
 .app-toolbar .search-container {
   flex: 1;
   max-width: 400px;
@@ -375,6 +418,14 @@ function navigateToMessage(item) {
   .app-title {
     flex: 1;
     font-size: 14px;
+  }
+
+  .panel-back-text {
+    display: none;
+  }
+
+  .panel-back-btn {
+    padding: 5px 8px;
   }
 
   .theme-switcher {
