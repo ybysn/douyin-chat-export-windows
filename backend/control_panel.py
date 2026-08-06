@@ -1,4 +1,4 @@
-"""Control panel for managing scraper, viewer, and export."""
+﻿"""Control panel for managing scraper, viewer, and export."""
 import asyncio
 import json
 import os
@@ -39,6 +39,26 @@ def _utf8_subprocess_env() -> dict:
     env["PYTHONUTF8"] = "1"
     env["PYTHONIOENCODING"] = "utf-8"
     env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _is_desktop() -> bool:
+    """True when running inside the Windows desktop build (GUI or worker)."""
+    return os.environ.get("DOUYIN_CHAT_DESKTOP") == "1"
+
+
+def _worker_subprocess_env() -> dict:
+    """Environment for scraper/refresh subprocesses.
+
+    Desktop workers run Chromium headless: the interactive login window only
+    exists in the control panel process, and refresh/scrape must reuse the
+    canonical profile without popping a visible browser. Docker/source mode
+    keeps its own HEADLESS configuration untouched.
+    """
+    env = _utf8_subprocess_env()
+    if _is_desktop():
+        env["HEADLESS"] = "true"
+        env["DOUYIN_CHAT_REQUIRE_EXISTING_LOGIN"] = "1"
     return env
 
 
@@ -494,41 +514,49 @@ async def panel_status():
 
 @control_router.post("/api/scrape")
 async def start_scrape(req: ScrapeRequest):
-    if _scrape_state["status"] == "running":
-        return JSONResponse({"error": "Scrape already running"}, status_code=409)
+    async with _browser_op_lock:
+        if _scrape_state["status"] == "running":
+            return JSONResponse({"error": "Scrape already running"}, status_code=409)
+        if _discover_state["status"] == "running":
+            return JSONResponse({"error": "刷新会话列表进行中，请先等待完成"}, status_code=409)
+        if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+            return JSONResponse(
+                {"error": "登录流程进行中，请先取消或等待完成"},
+                status_code=409,
+            )
 
-    probe = await _probe_login_state()
-    if not probe["has_cookies"]:
-        return JSONResponse(
-            {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
-            status_code=400,
-        )
+        probe = await _probe_login_state()
+        if not probe["has_cookies"]:
+            return JSONResponse(
+                {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
+                status_code=400,
+            )
 
-    # Selected conversations (checkbox list) take precedence over free-text filter
-    effective_filter = ",".join(req.conversations) if req.conversations else req.filter
+        # Selected conversations (checkbox list) take precedence over free-text filter
+        effective_filter = ",".join(req.conversations) if req.conversations else req.filter
 
-    cmd = [sys.executable, "-u", "extract.py"]
-    if req.incremental:
-        cmd.append("--incremental")
-    if effective_filter:
-        cmd.extend(["--filter", effective_filter])
-    if _load_config().get("download_images"):
-        cmd.append("--download-images")
+        cmd = [sys.executable, "-u", "extract.py"]
+        if req.incremental:
+            cmd.append("--incremental")
+        if effective_filter:
+            cmd.extend(["--filter", effective_filter])
+        if _load_config().get("download_images"):
+            cmd.append("--download-images")
 
-    _scrape_state["status"] = "running"
-    _scrape_state["started_at"] = time.time()
-    _scrape_state["finished_at"] = None
-    _scrape_state["message"] = f"{'增量' if req.incremental else '全量'}采集"
-    if req.conversations:
-        _scrape_state["message"] += f" ({len(req.conversations)} 个会话)"
-    elif req.filter:
-        _scrape_state["message"] += f" (过滤: {req.filter})"
+        _scrape_state["status"] = "running"
+        _scrape_state["started_at"] = time.time()
+        _scrape_state["finished_at"] = None
+        _scrape_state["message"] = f"{'增量' if req.incremental else '全量'}采集"
+        if req.conversations:
+            _scrape_state["message"] += f" ({len(req.conversations)} 个会话)"
+        elif req.filter:
+            _scrape_state["message"] += f" (过滤: {req.filter})"
 
-    # Persist selection so it's remembered next time
-    if req.conversations is not None:
-        cfg = _load_config()
-        cfg["scraper_selected"] = list(req.conversations)
-        _save_config(cfg)
+        # Persist selection so it's remembered next time
+        if req.conversations is not None:
+            cfg = _load_config()
+            cfg["scraper_selected"] = list(req.conversations)
+            _save_config(cfg)
 
     asyncio.create_task(_run_scrape(cmd))
     return {"status": "started", "message": _scrape_state["message"]}
@@ -547,7 +575,7 @@ async def _run_scrape(cmd):
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=os.path.dirname(os.path.dirname(__file__)),
-                env=_utf8_subprocess_env(),
+                env=_worker_subprocess_env(),
             )
             _scrape_state["process"] = proc
             await proc.wait()
@@ -638,12 +666,13 @@ def _read_conv_list():
 
 
 _login_probe_lock = asyncio.Lock()
+_browser_op_lock = asyncio.Lock()
 
 
 async def _probe_login_state() -> dict:
     """Single source of truth for whether the persistent profile is logged in.
 
-    Always launches Chromium against `_USER_DATA_DIR` and reads cookies via
+    Always launches Chromium against `_get_profile_dir()` and reads cookies via
     Playwright. This intentionally goes through the same code path Chromium
     uses internally so we never disagree with what the actual scraper sees
     (whatever path the cookies DB lives at, WAL checkpoints, format
@@ -659,8 +688,17 @@ async def _probe_login_state() -> dict:
     refresh/scrape preconditions can't race to launch two Chromium
     instances on the same profile (which would lock-conflict).
     """
+    # Never open a second persistent context on the profile while an
+    # interactive login window (or its screenshot predecessor) is active.
+    if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+        return {
+            "status": "busy",
+            "has_cookies": False,
+            "interaction_mode": _login_state["interaction_mode"],
+        }
+
     async with _login_probe_lock:
-        has_profile = os.path.isdir(_USER_DATA_DIR) and os.listdir(_USER_DATA_DIR)
+        has_profile = os.path.isdir(_get_profile_dir()) and os.listdir(_get_profile_dir())
         if not has_profile:
             return {"status": "no_profile", "has_cookies": False}
         try:
@@ -668,7 +706,7 @@ async def _probe_login_state() -> dict:
             pw = await async_playwright().start()
             try:
                 ctx = await pw.chromium.launch_persistent_context(
-                    _USER_DATA_DIR, headless=True,
+                    _get_profile_dir(), headless=True,
                     viewport={"width": 1400, "height": 900}, locale="zh-CN",
                     args=["--disable-blink-features=AutomationControlled"],
                 )
@@ -693,27 +731,33 @@ async def _probe_login_state() -> dict:
 @control_router.post("/api/conversations/refresh")
 async def refresh_conversations():
     """Run a lightweight scrape that only enumerates the conversation list."""
-    if _discover_state["status"] == "running":
-        return JSONResponse({"error": "Refresh already running"}, status_code=409)
-    if _scrape_state["status"] == "running":
-        return JSONResponse({"error": "Scraper is running — stop it first"}, status_code=409)
+    async with _browser_op_lock:
+        if _discover_state["status"] == "running":
+            return JSONResponse({"error": "Refresh already running"}, status_code=409)
+        if _scrape_state["status"] == "running":
+            return JSONResponse({"error": "Scraper is running — stop it first"}, status_code=409)
+        if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+            return JSONResponse(
+                {"error": "登录流程进行中，请先取消或等待完成"},
+                status_code=409,
+            )
 
-    # Pre-check: don't spawn the 3-minute browser wait if we already know
-    # there's no usable session. Uses the same Playwright probe as the
-    # login badge so the two never disagree.
-    probe = await _probe_login_state()
-    if not probe["has_cookies"]:
-        return JSONResponse(
-            {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
-            status_code=400,
-        )
+        # Pre-check: don't spawn the 3-minute browser wait if we already know
+        # there's no usable session. Uses the same Playwright probe as the
+        # login badge so the two never disagree.
+        probe = await _probe_login_state()
+        if not probe["has_cookies"]:
+            return JSONResponse(
+                {"error": "未检测到登录态，请先扫码登录或导入 Cookie"},
+                status_code=400,
+            )
 
-    _discover_state["status"] = "running"
-    _discover_state["message"] = "正在加载会话列表..."
-    _discover_state["started_at"] = time.time()
-    _discover_state["finished_at"] = None
+        _discover_state["status"] = "running"
+        _discover_state["message"] = "正在加载会话列表..."
+        _discover_state["started_at"] = time.time()
+        _discover_state["finished_at"] = None
 
-    cmd = [sys.executable, "-u", "extract.py", "--list-conversations"]
+        cmd = [sys.executable, "-u", "extract.py", "--list-conversations"]
     asyncio.create_task(_run_discover(cmd))
     return {"status": "started"}
 
@@ -728,7 +772,7 @@ async def _run_discover(cmd):
                 stdout=log_file,
                 stderr=asyncio.subprocess.STDOUT,
                 cwd=os.path.dirname(os.path.dirname(__file__)),
-                env=_utf8_subprocess_env(),
+                env=_worker_subprocess_env(),
             )
             _discover_state["process"] = proc
             await proc.wait()
@@ -1051,14 +1095,23 @@ async def download_export():
     return FileResponse(path, filename=path.name)
 
 
-# ── Login (in-container headless with screenshot) ──
+# ── Login (desktop: real Chromium window; web/docker: headless screenshot) ──
 
 import base64
 
-_USER_DATA_DIR = paths.BROWSER_PROFILE
+
+def _get_profile_dir() -> str:
+    """Return the canonical browser profile directory at call time.
+
+    Never cache this at import: a desktop build sets DOUYIN_CHAT_DATA_DIR in
+    configure_environment() before backend imports, and call-time resolution
+    keeps login / probe / refresh / scrape on the exact same profile.
+    """
+    return paths.BROWSER_PROFILE
 
 _login_state = {
-    "status": "idle",  # idle | starting | waiting_scan | logged_in | failed
+    "status": "idle",  # idle | starting | waiting_scan | waiting_login | logged_in | failed | cancelled
+    "interaction_mode": "native_window" if _is_desktop() else "screenshot",  # screenshot (web/docker) | native_window (desktop)
     "screenshot": None,  # base64 png
     "message": "",
     "countdown": 0,
@@ -1070,28 +1123,47 @@ _login_state = {
 @control_router.get("/api/login/check")
 async def login_check():
     """Check login by actually opening browser and reading cookies."""
-    return await _probe_login_state()
+    probe = await _probe_login_state()
+    probe["interaction_mode"] = _login_state["interaction_mode"]
+    return probe
 
 
 @control_router.post("/api/login/start")
 async def login_start():
-    if _login_state["status"] in ("starting", "waiting_scan"):
-        return JSONResponse({"error": "已在登录流程中"}, status_code=409)
-    # If scraper is running, reject
-    if _scrape_state["status"] == "running":
-        return JSONResponse({"error": "请先停止采集再登录"}, status_code=409)
+    async with _browser_op_lock:
+        if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+            return JSONResponse({"error": "已在登录流程中"}, status_code=409)
+        # If scraper or refresh is running, reject: the same persistent profile
+        # must never be opened by two Chromium instances.
+        if _scrape_state["status"] == "running":
+            return JSONResponse({"error": "请先停止采集再登录"}, status_code=409)
+        if _discover_state["status"] == "running":
+            return JSONResponse({"error": "请先停止刷新会话列表再登录"}, status_code=409)
 
-    _login_state["status"] = "starting"
-    _login_state["screenshot"] = None
-    _login_state["message"] = "正在启动浏览器..."
-    asyncio.create_task(_login_flow())
-    return {"status": "started"}
+        _login_state["status"] = "starting"
+        _login_state["screenshot"] = None
+        _login_state["countdown"] = 0
+        if _is_desktop():
+            _login_state["interaction_mode"] = "native_window"
+            _login_state["message"] = "正在打开抖音登录窗口..."
+        else:
+            _login_state["interaction_mode"] = "screenshot"
+            _login_state["message"] = "正在启动浏览器..."
+    if _is_desktop():
+        asyncio.create_task(_login_flow_desktop())
+    else:
+        asyncio.create_task(_login_flow())
+    return {
+        "status": "started",
+        "interaction_mode": _login_state["interaction_mode"],
+    }
 
 
 @control_router.get("/api/login/status")
 async def login_status():
     return {
         "status": _login_state["status"],
+        "interaction_mode": _login_state["interaction_mode"],
         "screenshot": _login_state["screenshot"],
         "message": _login_state["message"],
         "countdown": _login_state["countdown"],
@@ -1175,19 +1247,26 @@ async def login_keyboard(req: KeyAction):
 
 @control_router.post("/api/login/cancel")
 async def login_cancel():
-    await _login_cleanup()
-    _login_state["status"] = "idle"
-    _login_state["message"] = "已取消"
-    _login_state["screenshot"] = None
+    async with _browser_op_lock:
+        _login_state["status"] = "idle"
+        _login_state["message"] = "已取消"
+        _login_state["screenshot"] = None
+        _login_state["countdown"] = 0
+        await _login_cleanup()
     return {"status": "cancelled"}
 
 
 @control_router.post("/api/login/clear")
 async def login_clear():
-    """Clear browser profile to force re-login."""
-    import shutil
-    if os.path.isdir(_USER_DATA_DIR):
-        shutil.rmtree(_USER_DATA_DIR, ignore_errors=True)
+    """Clear browser profile to force re-login. Only this action deletes the profile."""
+    async with _browser_op_lock:
+        if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+            return JSONResponse({"error": "登录流程进行中，请先取消"}, status_code=409)
+        if _scrape_state["status"] == "running" or _discover_state["status"] == "running":
+            return JSONResponse({"error": "采集或刷新进行中，请先停止"}, status_code=409)
+        import shutil
+        if os.path.isdir(_get_profile_dir()):
+            shutil.rmtree(_get_profile_dir(), ignore_errors=True)
     return {"status": "cleared"}
 
 
@@ -1229,11 +1308,17 @@ def _validate_cookie_entries(parsed: list[dict]) -> tuple[list[str], list[str]]:
 @control_router.post("/api/login/cookie-import")
 async def login_cookie_import(req: CookieImportRequest):
     """Import cookies from browser DevTools or document.cookie string."""
-    if _scrape_state["status"] == "running":
-        return JSONResponse({"error": "采集进行中，请先停止"}, status_code=409)
-    if _login_state["status"] in ("starting", "waiting_scan"):
-        return JSONResponse({"error": "登录流程进行中，请先取消"}, status_code=409)
+    async with _browser_op_lock:
+        if _scrape_state["status"] == "running":
+            return JSONResponse({"error": "采集进行中，请先停止"}, status_code=409)
+        if _discover_state["status"] == "running":
+            return JSONResponse({"error": "刷新会话列表进行中，请先停止"}, status_code=409)
+        if _login_state["status"] in ("starting", "waiting_scan", "waiting_login"):
+            return JSONResponse({"error": "登录流程进行中，请先取消"}, status_code=409)
+        return await _do_cookie_import(req)
 
+
+async def _do_cookie_import(req: CookieImportRequest):
     raw = req.cookies.strip()
     if not raw:
         return JSONResponse({"error": "Cookie 数据为空"}, status_code=400)
@@ -1301,10 +1386,10 @@ async def login_cookie_import(req: CookieImportRequest):
 
     try:
         from playwright.async_api import async_playwright
-        os.makedirs(_USER_DATA_DIR, exist_ok=True)
+        os.makedirs(_get_profile_dir(), exist_ok=True)
         pw = await async_playwright().start()
         ctx = await pw.chromium.launch_persistent_context(
-            _USER_DATA_DIR,
+            _get_profile_dir(),
             headless=True,
             viewport={"width": 1400, "height": 900},
             locale="zh-CN",
@@ -1358,17 +1443,95 @@ async def _login_cleanup():
     _login_state["_pw"] = None
 
 
+async def _login_flow_desktop():
+    """Desktop: open a real interactive Chromium window on the canonical profile.
+
+    The user completes slider / SMS / QR login directly in the window. Cookies
+    are written into the same persistent profile that refresh and scrape
+    workers reuse, so the login state survives app restarts.
+    """
+    try:
+        from playwright.async_api import async_playwright
+
+        profile_dir = _get_profile_dir()
+        os.makedirs(profile_dir, exist_ok=True)
+        pw = await async_playwright().start()
+        _login_state["_pw"] = pw
+
+        closed = asyncio.Event()
+
+        def _on_close():
+            closed.set()
+
+        ctx = await pw.chromium.launch_persistent_context(
+            profile_dir,
+            headless=False,
+            viewport={"width": 1280, "height": 820},
+            locale="zh-CN",
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        _login_state["_context"] = ctx
+        ctx.on("close", _on_close)
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        page = ctx.pages[0] if ctx.pages else await ctx.new_page()
+
+        _login_state["status"] = "waiting_login"
+        _login_state["message"] = "请在弹出的抖音浏览器窗口中完成登录"
+        await page.goto("https://www.douyin.com/", wait_until="domcontentloaded")
+
+        # Poll until a non-empty sessionid appears or the window is closed.
+        timeout_secs = 600
+        for _ in range(timeout_secs):
+            if _login_state["status"] != "waiting_login":
+                return  # cancelled
+            if closed.is_set():
+                _login_state["status"] = "cancelled"
+                _login_state["message"] = "登录窗口已关闭，未完成登录"
+                return
+            try:
+                cookies = await ctx.cookies("https://www.douyin.com")
+            except Exception:
+                cookies = []
+            if any(c["name"] == "sessionid" and c["value"] for c in cookies):
+                # Close the browser and release the profile lock BEFORE
+                # reporting success, so a refresh/scrape can reopen the
+                # profile immediately afterwards.
+                await ctx.close()
+                _login_state["_context"] = None
+                await pw.stop()
+                _login_state["_pw"] = None
+                _login_state["status"] = "logged_in"
+                _login_state["message"] = "登录成功！"
+                _login_state["screenshot"] = None
+                return
+            await asyncio.sleep(1)
+
+        _login_state["status"] = "failed"
+        _login_state["message"] = "登录超时（10 分钟），请重试"
+    except Exception as e:
+        _login_state["status"] = "failed"
+        _login_state["message"] = f"登录错误: {e}"
+    finally:
+        await _login_cleanup()
+        if _login_state["status"] == "waiting_login":
+            _login_state["status"] = "failed"
+            _login_state["message"] = "登录窗口意外关闭，未完成登录"
+
+
 async def _login_flow():
     """In-container: open headless browser, screenshot the page for QR scanning."""
     try:
         from playwright.async_api import async_playwright
 
-        os.makedirs(_USER_DATA_DIR, exist_ok=True)
+        _login_state["interaction_mode"] = "screenshot"
+        os.makedirs(_get_profile_dir(), exist_ok=True)
         pw = await async_playwright().start()
         _login_state["_pw"] = pw
 
         ctx = await pw.chromium.launch_persistent_context(
-            _USER_DATA_DIR,
+            _get_profile_dir(),
             headless=True,
             viewport={"width": 1400, "height": 900},
             locale="zh-CN",

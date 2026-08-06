@@ -162,6 +162,10 @@ def run_desktop() -> int:
 
 
 def main() -> int:
+    # Mark this process as the desktop build BEFORE configure_environment()
+    # imports anything that resolves paths (common.paths, backend.control_panel,
+    # extractor.web_scraper). Workers inherit the flag from this environment.
+    os.environ.setdefault("DOUYIN_CHAT_DESKTOP", "1")
     resources, app_dir = configure_environment()
     logging.info("Environment configured")
     logging.info("Configured resource directory: %s", resources)

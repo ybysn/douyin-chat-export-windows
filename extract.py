@@ -71,7 +71,14 @@ async def run():
 
     try:
         await scraper.launch()
-        logged_in = await scraper.wait_for_login()
+        if os.environ.get("DOUYIN_CHAT_REQUIRE_EXISTING_LOGIN") == "1":
+            # Desktop workers must never wait for an interactive login: the
+            # headed login window only exists in the control panel process.
+            logged_in = await scraper.has_login()
+            if not logged_in:
+                print("[-] 未检测到有效登录态（DOUYIN_CHAT_REQUIRE_EXISTING_LOGIN=1），快速退出")
+        else:
+            logged_in = await scraper.wait_for_login()
         if not logged_in:
             print("[-] 未能登录，退出")
             return 2  # non-zero exit so the panel surfaces this as a failure

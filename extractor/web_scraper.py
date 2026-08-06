@@ -28,7 +28,16 @@ from extractor.models import (
 )
 
 CHAT_URL = "https://www.douyin.com/chat?isPopup=1"
-USER_DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "browser_profile")
+
+
+def get_browser_profile_dir() -> str:
+    """Return the single canonical browser profile directory.
+
+    Resolved at call time from ``common.paths`` so a desktop build that sets
+    ``DOUYIN_CHAT_DATA_DIR`` before importing the backend gets the
+    ``%LOCALAPPDATA%`` path instead of a bundle-internal path.
+    """
+    return paths.BROWSER_PROFILE
 
 # IM 用户信息接口：POST sec_user_ids=<JSON 数组> → {data: [{uid, nickname, unique_id, avatar_thumb}]}
 # 只认 cookies，不需要 msToken/a_bogus（与 batch_play_info 同理）。
@@ -196,13 +205,14 @@ class WebChatScraper:
         self._last_known_timestamp = 0  # 跨批次时间戳继承
 
     async def launch(self):
-        os.makedirs(USER_DATA_DIR, exist_ok=True)
+        profile_dir = get_browser_profile_dir()
+        os.makedirs(profile_dir, exist_ok=True)
         init_db()
         self._db_conn = get_db()
 
         self.pw = await async_playwright().start()
         self.context = await self.pw.chromium.launch_persistent_context(
-            USER_DATA_DIR,
+            profile_dir,
             headless=os.environ.get("HEADLESS", "false").lower() == "true",
             viewport={"width": 1400, "height": 900},
             locale="zh-CN",
@@ -213,6 +223,16 @@ class WebChatScraper:
         """)
         self.page = self.context.pages[0] if self.context.pages else await self.context.new_page()
         print("[+] 浏览器已启动")
+
+    async def has_login(self) -> bool:
+        """One-shot login check (no interactive wait).
+
+        Used by desktop workers so they fail fast instead of waiting up to
+        three minutes for an interactive login that cannot appear in a
+        headless worker.
+        """
+        cookies = await self.context.cookies("https://www.douyin.com")
+        return any(c["name"] == "sessionid" and c["value"] for c in cookies)
 
     async def wait_for_login(self):
         await self.page.goto("https://www.douyin.com/", wait_until="domcontentloaded")

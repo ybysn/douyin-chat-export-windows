@@ -508,6 +508,7 @@ select:focus, input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px v
   <div class="section" id="loginSection">
     <h2><span data-i18n="loginTitle">登录</span> <span class="status status-idle" id="loginStatus" data-i18n="checking">检测中...</span></h2>
     <div id="loginInfo" class="meta" style="margin-bottom:10px"></div>
+    <div class="meta" id="loginDesktopHint" style="display:none;margin-bottom:10px" data-i18n="desktopLoginHint">请在弹出的浏览器中完成滑块、验证码或扫码登录。登录成功后窗口会自动关闭。</div>
     <div class="row">
       <button class="btn btn-primary" id="loginBtn" onclick="startLogin()" data-i18n="scanQr">扫码登录</button>
       <button class="btn btn-danger" id="loginCancelBtn" onclick="cancelLogin()" style="display:none" data-i18n="cancel">取消</button>
@@ -590,6 +591,11 @@ const T = {
     statUsers: '用户',
     loginTitle: '登录',
     scanQr: '扫码登录',
+    desktopLoginBtn: '打开抖音登录窗口',
+    desktopLoginHint: '请在弹出的浏览器中完成滑块、验证码或扫码登录。登录成功后窗口会自动关闭。',
+    waitingLogin: '等待登录窗口',
+    loginCancelled: '登录已取消',
+    loginWindowClosed: '登录窗口已关闭，未完成登录',
     cancel: '取消',
     clearSession: '清除会话',
     clickScreenshotHint: '点击截图进行交互。下方输入文本后回车发送。',
@@ -692,6 +698,11 @@ const T = {
     statUsers: 'Users',
     loginTitle: 'Login',
     scanQr: 'Scan QR Login',
+    desktopLoginBtn: 'Open Douyin login window',
+    desktopLoginHint: 'Complete slider, verification code, or QR login in the opened browser window. It will close automatically after login.',
+    waitingLogin: 'Waiting for login window',
+    loginCancelled: 'Login cancelled',
+    loginWindowClosed: 'Login window closed before login completed',
     cancel: 'Cancel',
     clearSession: 'Clear Session',
     clickScreenshotHint: 'Click the screenshot to interact. Type below to input text.',
@@ -1412,7 +1423,23 @@ async function checkLogin() {
       setDynText(ls, d.status); ls.className = 'status status-idle';
       setDynText(info, d.message || '');
     }
+    applyLoginInteractionMode(d.interaction_mode);
   } catch { setText(ls, 'error'); ls.className = 'status status-failed'; }
+}
+
+function applyLoginInteractionMode(mode) {
+  const desktop = mode === 'native_window';
+  const hint = document.getElementById('loginDesktopHint');
+  const screenshot = document.getElementById('loginScreenshot');
+  const btn = document.getElementById('loginBtn');
+  if (!hint || !screenshot || !btn) return;
+  hint.style.display = desktop ? '' : 'none';
+  if (desktop) {
+    screenshot.style.display = 'none';
+    setText(btn, 'desktopLoginBtn');
+  } else {
+    setText(btn, 'scanQr');
+  }
 }
 
 async function startLogin() {
@@ -1433,6 +1460,8 @@ function finishLogin() {
   document.getElementById('loginBtn').disabled = false;
   document.getElementById('loginCancelBtn').style.display = 'none';
   document.getElementById('loginScreenshot').style.display = 'none';
+  const hint = document.getElementById('loginDesktopHint');
+  if (hint) hint.style.display = 'none';
 }
 
 async function pollLoginStatus() {
@@ -1442,6 +1471,8 @@ async function pollLoginStatus() {
     const ls = document.getElementById('loginStatus');
     const info = document.getElementById('loginInfo');
 
+    applyLoginInteractionMode(d.interaction_mode);
+
     if (d.status === 'waiting_scan') {
       setText(ls, 'waitingScan'); ls.className = 'status status-running';
       setDynText(info, d.message || '');
@@ -1449,9 +1480,16 @@ async function pollLoginStatus() {
         document.getElementById('loginImg').src = 'data:image/png;base64,' + d.screenshot;
         document.getElementById('loginScreenshot').style.display = '';
       }
+    } else if (d.status === 'waiting_login') {
+      setText(ls, 'waitingLogin'); ls.className = 'status status-running';
+      setDynText(info, d.message || '');
     } else if (d.status === 'logged_in') {
       setText(ls, 'completed'); ls.className = 'status status-completed';
       setDynText(info, d.message);
+      finishLogin();
+    } else if (d.status === 'cancelled') {
+      setText(ls, 'idle'); ls.className = 'status status-idle';
+      setDynText(info, d.message || t('loginCancelled'));
       finishLogin();
     } else if (d.status === 'failed') {
       setText(ls, 'failed'); ls.className = 'status status-failed';
