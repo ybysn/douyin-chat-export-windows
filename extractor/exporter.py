@@ -7,6 +7,7 @@ import os
 import re
 import time
 import urllib.parse
+from datetime import datetime
 
 from extractor.models import get_db
 
@@ -22,6 +23,48 @@ CHATLAB_TYPE_MAP = {
 
 
 _STICKER_HEX_RE = re.compile(r"-ts-([0-9a-fA-F]{4,})(?:\.[a-zA-Z0-9]{1,5})?$")
+
+_WINDOWS_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _export_date() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def conversation_export_filename(conv_id: str, ext: str) -> str:
+    """Build a Windows-safe ``id_date.ext`` export filename."""
+    safe_id = re.sub(r"[^\w.-]+", "_", str(conv_id or ""), flags=re.UNICODE)
+    safe_id = safe_id.strip(" .")[:160] or "conv"
+    if safe_id.upper() in _WINDOWS_RESERVED_NAMES:
+        safe_id = f"_{safe_id}"
+    return f"{safe_id}_{_export_date()}{ext}"
+
+
+def export_to_generated_path(exporter, output_dir: str, ext: str):
+    """Export via a temporary file, then rename it from the real conversation ID."""
+    os.makedirs(output_dir, exist_ok=True)
+    temporary_path = os.path.join(output_dir, f".exporting{ext}")
+    if os.path.exists(temporary_path):
+        os.remove(temporary_path)
+
+    exported = exporter.export(temporary_path)
+    if not os.path.exists(temporary_path):
+        return None, exported
+
+    conv_id = exported.get("conv_id") if isinstance(exported, dict) else None
+    if not conv_id:
+        os.remove(temporary_path)
+        raise RuntimeError("导出结果缺少真实会话 ID")
+
+    output_path = os.path.join(
+        output_dir, conversation_export_filename(conv_id, ext)
+    )
+    os.replace(temporary_path, output_path)
+    return output_path, exported
 
 
 def _decode_sticker_name(url: str) -> str | None:
@@ -483,3 +526,4 @@ class ChatLabExporter:
             print(f"  引用/回复: {ref_count}")
         size_mb = os.path.getsize(output_path) / (1024 * 1024)
         print(f"  文件大小: {size_mb:.1f} MB")
+        return {"conv_id": str(conv_id), "conv_name": conv_name}

@@ -991,8 +991,11 @@ def _unique_zip_arcname(safe: str, ext: str, used: set[str]) -> str:
 
 def _do_export(fmt: str, filter_name: str, conversations: list | None):
     try:
-        from extractor.exporter import ChatLabExporter
-        import re
+        from extractor.exporter import (
+            ChatLabExporter,
+            conversation_export_filename,
+            export_to_generated_path,
+        )
         import zipfile
 
         ext = ".json" if fmt == "json" else ".jsonl"
@@ -1009,18 +1012,13 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
 
         if len(targets) <= 1:
             # Single file
-            output_path = data_dir / f"export{ext}"
-            # Remove stale file so a "conv not found" early-return doesn't look like success
-            if os.path.exists(output_path):
-                try:
-                    os.remove(output_path)
-                except Exception:
-                    pass
             exporter = ChatLabExporter(conv_name=targets[0] or None, output_format=fmt)
-            exporter.export(output_path)
-            if not os.path.exists(output_path):
+            output_path, _ = export_to_generated_path(exporter, str(data_dir), ext)
+            if not output_path:
                 raise RuntimeError(f"未找到会话: {targets[0] or '(any)'}")
-            _export_state["file_path"] = f"export{ext}"
+            output_path = Path(output_path)
+            file_name = output_path.name
+            _export_state["file_path"] = file_name
             size_mb = os.path.getsize(output_path) / (1024 * 1024)
             _export_state["message"] = f"导出完成 ({size_mb:.1f} MB)"
         else:
@@ -1043,16 +1041,22 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
 
             produced = []
             used_arcnames: set[str] = set()
-            for name in targets:
-                safe = re.sub(
-                    r"[^\w\u4e00-\u9fff.-]+", "_", str(name or "")
-                )[:80] or "conv"
-                arcname = _unique_zip_arcname(safe, ext, used_arcnames)
-                path = tmp_dir / arcname
+            for index, name in enumerate(targets):
+                path = tmp_dir / f"item_{index}{ext}"
                 try:
-                    ChatLabExporter(conv_name=name, output_format=fmt).export(path)
-                    if os.path.exists(path):
+                    exported = ChatLabExporter(
+                        conv_name=name, output_format=fmt
+                    ).export(path)
+                    conv_id = exported.get("conv_id") if isinstance(exported, dict) else None
+                    if os.path.exists(path) and conv_id:
+                        file_name = conversation_export_filename(conv_id, ext)
+                        arcname = _unique_zip_arcname(
+                            file_name[:-len(ext)], ext, used_arcnames
+                        )
                         produced.append((name, path, arcname))
+                    elif os.path.exists(path):
+                        os.remove(path)
+                        print(f"[-] 导出 {name} 失败: 导出结果缺少真实会话 ID")
                 except Exception as e:
                     print(f"[-] 导出 {name} 失败: {e}")
 

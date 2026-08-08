@@ -4,6 +4,7 @@ Locks the exact output strings/types the exporter produces, so the P4 refactor
 (splitting the 240-line export() god-method into pure functions) cannot drift.
 """
 import json
+import sys
 
 from extractor import exporter
 from extractor.exporter import (
@@ -183,8 +184,53 @@ def test_export_json_format_shape(temp_db, tmp_path):
     conn.close()
 
     out = str(tmp_path / "e.json")
-    ChatLabExporter(conv_name="会话J", output_format="json").export(out)
+    result = ChatLabExporter(conv_name="会话J", output_format="json").export(out)
     data = json.loads(open(out, encoding="utf-8").read())
+    assert result == {"conv_id": "c1", "conv_name": "会话J"}
     assert data["chatlab"]["version"] == "0.0.2"
     assert isinstance(data["members"], list)
     assert data["messages"][0]["content"] == "hi"
+
+
+def test_extract_cli_default_uses_id_date_filename(temp_db, tmp_path, monkeypatch):
+    import extract as extract_cli
+    import extractor.models as models
+    import common.paths as paths
+
+    conn = models.get_db()
+    insert_conversation(conn, "0:1:user/a", "CLI会话", last_message_time=10)
+    conn.commit()
+    conn.close()
+
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr(exporter, "_export_date", lambda: "2026-08-09")
+
+    extract_cli.run_export({
+        "output_format": "jsonl",
+        "output_path": None,
+        "name_filter": "CLI会话",
+    })
+
+    assert (data_dir / "0_1_user_a_2026-08-09.jsonl").is_file()
+
+
+def test_standalone_export_cli_default_uses_id_date_filename(
+        temp_db, tmp_path, monkeypatch):
+    import export as export_cli
+    import extractor.models as models
+
+    conn = models.get_db()
+    insert_conversation(conn, "conv-42", "独立CLI会话", last_message_time=10)
+    conn.commit()
+    conn.close()
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(exporter, "_export_date", lambda: "2026-08-09")
+    monkeypatch.setattr(
+        sys, "argv", ["export.py", "--filter", "独立CLI会话"]
+    )
+
+    export_cli.main()
+
+    assert (tmp_path / "data" / "conv-42_2026-08-09.jsonl").is_file()

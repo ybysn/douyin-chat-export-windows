@@ -509,27 +509,44 @@ def test_panel_web_mode_keeps_http_download_without_pywebview():
 
 class _FakeChatLabExporter:
     def __init__(self, **kwargs):
-        pass
+        self.conv_name = kwargs.get("conv_name")
 
     def export(self, path):
         Path(path).write_text("{}", encoding="utf-8")
+        return {"conv_id": self.conv_name or "7670159743629017637"}
 
 
-def test_single_export_returns_safe_file_name(monkeypatch, tmp_path):
+def test_single_export_returns_id_date_file_name(monkeypatch, tmp_path):
     monkeypatch.setattr(paths, "DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+    monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
-    control_panel._do_export("json", "", None)
+    control_panel._do_export("jsonl", "", None)
 
     assert control_panel._export_state["status"] == "completed"
-    assert control_panel._export_state["file_path"] == "export.json"
+    assert control_panel._export_state["file_path"] == "7670159743629017637_2026-08-09.jsonl"
     assert not Path(control_panel._export_state["file_path"]).is_absolute()
+    assert (tmp_path / "data" / "7670159743629017637_2026-08-09.jsonl").is_file()
+
+
+def test_single_export_sanitizes_windows_unsafe_id(monkeypatch, tmp_path):
+    data_dir = tmp_path / "data"
+    monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
+    monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+    monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
+
+    control_panel._do_export("jsonl", "0:1:user/a", ["0:1:user/a"])
+
+    assert control_panel._export_state["status"] == "completed"
+    assert control_panel._export_state["file_path"] == "0_1_user_a_2026-08-09.jsonl"
+    assert (data_dir / "0_1_user_a_2026-08-09.jsonl").is_file()
 
 
 def test_multi_export_returns_zip_file_name(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+    monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
     control_panel._do_export("jsonl", "", ["会话A", "会话B"])
 
@@ -538,13 +555,17 @@ def test_multi_export_returns_zip_file_name(monkeypatch, tmp_path):
     zip_path = data_dir / "export.zip"
     assert zip_path.is_file()
     with zipfile.ZipFile(zip_path) as zf:
-        assert len(zf.namelist()) == 2
+        assert zf.namelist() == [
+            "会话A_2026-08-09.jsonl",
+            "会话B_2026-08-09.jsonl",
+        ]
 
 
 def test_multi_export_avoids_colliding_arcnames(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+    monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
     control_panel._do_export("jsonl", "", ["A/B", "A\\B", "A B", "CON", "", ""])
 
@@ -553,18 +574,19 @@ def test_multi_export_avoids_colliding_arcnames(monkeypatch, tmp_path):
     with zipfile.ZipFile(zip_path) as zf:
         names = zf.namelist()
     assert len(names) == len(set(names))
-    assert "A_B.jsonl" in names
-    assert "A_B_2.jsonl" in names
-    assert "A_B_3.jsonl" in names
-    assert "_CON.jsonl" in names
-    assert "conv.jsonl" in names
-    assert "conv_2.jsonl" in names
+    assert "A_B_2026-08-09.jsonl" in names
+    assert "A_B_2026-08-09_2.jsonl" in names
+    assert "A_B_2026-08-09_3.jsonl" in names
+    assert "_CON_2026-08-09.jsonl" in names
+    assert "7670159743629017637_2026-08-09.jsonl" in names
+    assert "7670159743629017637_2026-08-09_2.jsonl" in names
 
 
 def test_multi_export_zip_entries_are_relative_basenames(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
+    monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
     control_panel._do_export("json", "", ["会话A", "会话B"])
 

@@ -12,7 +12,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(__file__))
 
-from extractor.exporter import ChatLabExporter
+from extractor.exporter import ChatLabExporter, export_to_generated_path
 
 
 def main():
@@ -39,10 +39,13 @@ def main():
             i += 1
 
     ext = ".json" if output_format == "json" else ".jsonl"
-    output_path = output_path or os.path.join("data", f"export{ext}")
-
     exporter = ChatLabExporter(conv_name=name_filter, output_format=output_format)
-    exporter.export(output_path)
+    if output_path:
+        exporter.export(output_path)
+    else:
+        final_path, _ = export_to_generated_path(exporter, "data", ext)
+        if final_path:
+            print(f"[+] 最终导出文件: {final_path}")
 
 
 if __name__ == "__main__":

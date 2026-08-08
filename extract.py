@@ -39,17 +39,20 @@ def _parse_args():
 def run_export(args):
     """Export chat data to ChatLab format (no browser needed)."""
     from common import paths
-    from extractor.exporter import ChatLabExporter
+    from extractor.exporter import ChatLabExporter, export_to_generated_path
 
     fmt = args["output_format"]
     ext = ".json" if fmt == "json" else ".jsonl"
-    output_path = args["output_path"] or os.path.join(paths.DATA_DIR, f"export{ext}")
-
     exporter = ChatLabExporter(
         conv_name=args["name_filter"],
         output_format=fmt,
     )
-    exporter.export(output_path)
+    if args["output_path"]:
+        exporter.export(args["output_path"])
+    else:
+        final_path, _ = export_to_generated_path(exporter, paths.DATA_DIR, ext)
+        if final_path:
+            print(f"[+] 最终导出文件: {final_path}")
 
 
 async def run():
