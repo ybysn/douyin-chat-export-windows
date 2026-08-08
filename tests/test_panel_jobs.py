@@ -73,11 +73,41 @@ def test_backfill_start_conflict(monkeypatch):
 
 
 def test_windows_subprocess_output_is_forced_to_utf8(monkeypatch):
+    monkeypatch.setenv("DOUYIN_CHAT_DESKTOP", "1")
     monkeypatch.setenv("PYTHONIOENCODING", "gbk")
-    env = cp._utf8_subprocess_env()
+    env = cp._worker_subprocess_env()
     assert env["PYTHONUTF8"] == "1"
     assert env["PYTHONIOENCODING"] == "utf-8"
     assert env["PYTHONUNBUFFERED"] == "1"
+    assert env["HEADLESS"] == "true"
+    assert env["DOUYIN_CHAT_REQUIRE_EXISTING_LOGIN"] == "1"
+
+
+def test_scrape_worker_receives_utf8_environment(isolated_scrape, monkeypatch):
+    captured = {}
+
+    class CompletedProc:
+        returncode = 0
+
+        async def wait(self):
+            return 0
+
+    async def fake_create_subprocess_exec(*cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        captured["log_encoding"] = kwargs["stdout"].encoding
+        kwargs["stdout"].write("采集日志")
+        return CompletedProc()
+
+    monkeypatch.setenv("DOUYIN_CHAT_DESKTOP", "1")
+    monkeypatch.setattr(cp.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+
+    asyncio.run(cp._run_scrape([sys.executable, "-u", "extract.py"]))
+
+    assert captured["env"]["PYTHONUTF8"] == "1"
+    assert captured["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert captured["log_encoding"].lower().replace("-", "") == "utf8"
+    assert cp._read_utf8_or_gbk(cp.LOG_PATH) == "采集日志"
 
 
 def test_log_reader_supports_utf8_and_legacy_gbk(tmp_path):

@@ -203,6 +203,7 @@ class WebChatScraper:
         self.page = None
         self._db_conn = None  # 持久数据库连接
         self._last_known_timestamp = 0  # 跨批次时间戳继承
+        self.processed_conv_ids = set()  # 本次运行内已确认并开始处理的真实会话 ID
 
     async def launch(self):
         profile_dir = get_browser_profile_dir()
@@ -661,24 +662,31 @@ class WebChatScraper:
     async def _find_and_click_conversation(self, target_name):
         """Find a conversation by name and click it.
 
-        JS does the matching (with whitespace/nbsp normalization, so Windows
-        vs. Linux discrepancies don't break `in` checks), but the ACTUAL
-        click uses Playwright's element handle — JS `.click()` only fires a
-        `click` event, while React listens for `pointerdown`/`mousedown`,
-        so a JS click was identified but wouldn't activate the conversation.
+        Scan the complete virtual list for an exact nickname/full-title match
+        before considering fuzzy candidates.  A fuzzy match is only safe when
+        it is unique across the whole scan.  The ACTUAL click still uses a
+        Playwright element handle — JS `.click()` only fires a `click` event,
+        while React listens for `pointerdown`/`mousedown`.
         """
-        async def _try_match():
-            """Return (matched_index, matched_text, debug_names) or (-1, '', names)."""
-            result = await self.page.evaluate(f"""(targetName) => {{
-                const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
-                const target = normalize(targetName);
-                const items = document.querySelectorAll('{SEL_CONV_ITEM}');
-                const debugNames = [];
+        def _normalize(value):
+            return re.sub(r"[\s\u00a0]+", " ", str(value or "")).strip()
 
-                for (let i = 0; i < items.length; i++) {{
-                    const item = items[i];
+        normalized_target = _normalize(target_name)
+
+        async def _scan_visible():
+            """Return every conversation currently rendered in the DOM."""
+            rows = await self.page.evaluate(f"""() => {{
+                const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
+                const items = document.querySelectorAll('{SEL_CONV_ITEM}');
+                const list = document.querySelector('{SEL_CONV_LIST}');
+                const scrollable = list?.querySelector('[style*="overflow"]') || list;
+                const listTop = scrollable?.getBoundingClientRect().top || 0;
+                const scrollTop = scrollable?.scrollTop || 0;
+                return Array.from(items).map((item, index) => {{
                     const titleEl = item.querySelector('{SEL_CONV_TITLE}');
-                    if (!titleEl) {{ debugNames.push(''); continue; }}
+                    if (!titleEl) {{
+                        return {{index, position: index, nickname: '', full_text: '', text: ''}};
+                    }}
 
                     const innerTitle = titleEl.querySelector('{SEL_CONV_TITLE}');
                     let nickname = '';
@@ -692,37 +700,123 @@ class WebChatScraper:
                     }}
 
                     const fullText = normalize(titleEl.textContent);
-                    debugNames.push(nickname || fullText.substring(0, 20));
+                    return {{
+                        index,
+                        position: Math.round(
+                            item.getBoundingClientRect().top - listTop + scrollTop
+                        ),
+                        nickname,
+                        full_text: fullText,
+                        text: nickname || fullText,
+                    }};
+                }});
+            }}""")
+            normalized = []
+            for row in rows or []:
+                candidate = dict(row)
+                candidate["nickname"] = _normalize(candidate.get("nickname"))
+                candidate["full_text"] = _normalize(candidate.get("full_text"))
+                candidate["text"] = candidate["nickname"] or candidate["full_text"]
+                normalized.append(candidate)
+            return normalized
 
-                    if (nickname === target ||
-                        (nickname && target.includes(nickname)) ||
-                        (nickname && nickname.includes(target)) ||
-                        fullText.includes(target)) {{
-                        return {{index: i, text: nickname || fullText, names: debugNames}};
-                    }}
-                }}
+        def _match_kind(candidate):
+            nickname = candidate["nickname"]
+            full_text = candidate["full_text"]
+            if not normalized_target:
+                return None
+            if nickname == normalized_target:
+                return ("exact", "nickname")
+            if full_text == normalized_target:
+                return ("exact", "full-title")
+            if ((nickname and normalized_target in nickname) or
+                    (nickname and nickname in normalized_target) or
+                    normalized_target in full_text):
+                return ("fuzzy", "fuzzy")
+            return None
 
-                return {{index: -1, text: '', names: debugNames}};
-            }}""", target_name)
-            return result
+        def _candidate_key(candidate):
+            return (
+                candidate["nickname"],
+                candidate["full_text"],
+                candidate.get("position", candidate["index"]),
+            )
 
-        async def _click_index(idx, text):
+        async def _click_candidate(candidate, match_type, matched_by, candidates):
+            idx = candidate["index"]
             items = await self.page.query_selector_all(SEL_CONV_ITEM)
             if idx < len(items):
                 await items[idx].click()
-                return {"found": True, "text": text}
+                return {
+                    "found": True,
+                    "ambiguous": False,
+                    "index": idx,
+                    "text": candidate["text"],
+                    "nickname": candidate["nickname"],
+                    "full_text": candidate["full_text"],
+                    "match_type": match_type,
+                    "matched_by": matched_by,
+                    "candidates": candidates,
+                }
             return None
 
-        # First attempt: match current DOM (don't disturb scroll state)
-        m = await _try_match()
-        if m["index"] >= 0:
-            clicked = await _click_index(m["index"], m["text"])
-            if clicked:
-                return clicked
+        fuzzy_candidates = {}
+        duplicate_fuzzy_keys = set()
+        all_debug_names = []
 
-        all_debug_names = list(m.get("names", []))
+        async def _inspect_visible():
+            visible = await _scan_visible()
+            for candidate in visible:
+                name = candidate["text"]
+                if name and name not in all_debug_names:
+                    all_debug_names.append(name)
 
-        # Not found in current view; scroll from top, incrementally.
+            # Prefer an exact nickname over an exact full title.  If the DOM
+            # itself contains multiple indistinguishable exact rows, fail
+            # closed rather than clicking one based on DOM order.
+            nickname_exact = [
+                c for c in visible if _match_kind(c) == ("exact", "nickname")
+            ]
+            full_title_exact = [
+                c for c in visible if _match_kind(c) == ("exact", "full-title")
+            ]
+            exact = nickname_exact or full_title_exact
+            if len(exact) == 1:
+                matched_by = "nickname" if nickname_exact else "full-title"
+                return await _click_candidate(
+                    exact[0], "exact", matched_by, [c["text"] for c in exact]
+                )
+            if len(exact) > 1:
+                return {
+                    "found": False,
+                    "ambiguous": True,
+                    "index": -1,
+                    "text": "",
+                    "candidates": [c["text"] for c in exact],
+                    "names": all_debug_names[:20],
+                    "count": len(all_debug_names),
+                }
+
+            batch_fuzzy = []
+            for candidate in visible:
+                match = _match_kind(candidate)
+                if match and match[0] == "fuzzy":
+                    batch_fuzzy.append(candidate)
+            batch_counts = {}
+            for candidate in batch_fuzzy:
+                key = _candidate_key(candidate)
+                batch_counts[key] = batch_counts.get(key, 0) + 1
+                fuzzy_candidates.setdefault(key, candidate)
+            duplicate_fuzzy_keys.update(key for key, count in batch_counts.items() if count > 1)
+            return None
+
+        # First inspect the current DOM without disturbing its scroll state.
+        selected = await _inspect_visible()
+        if selected:
+            return selected
+
+        # Exact phase: scan the complete virtual list from the top.  Fuzzy
+        # candidates are collected, never clicked during this phase.
         await self.page.evaluate(f"""() => {{
             const list = document.querySelector('{SEL_CONV_LIST}');
             if (list) {{
@@ -732,16 +826,10 @@ class WebChatScraper:
         }}""")
         await asyncio.sleep(0.5)
 
-        for _ in range(20):
-            m = await _try_match()
-            if m["index"] >= 0:
-                clicked = await _click_index(m["index"], m["text"])
-                if clicked:
-                    return clicked
-
-            for n in m.get("names", []):
-                if n and n not in all_debug_names:
-                    all_debug_names.append(n)
+        for _ in range(120):
+            selected = await _inspect_visible()
+            if selected:
+                return selected
 
             reached_bottom = await self.page.evaluate(f"""() => {{
                 const list = document.querySelector('{SEL_CONV_LIST}');
@@ -755,7 +843,80 @@ class WebChatScraper:
             if reached_bottom:
                 break
 
-        return {"found": False, "count": len(all_debug_names), "names": all_debug_names[:20]}
+        fuzzy_names = [candidate["text"] for candidate in fuzzy_candidates.values()]
+        if duplicate_fuzzy_keys or len(fuzzy_candidates) > 1:
+            return {
+                "found": False,
+                "ambiguous": True,
+                "index": -1,
+                "text": "",
+                "candidates": fuzzy_names,
+                "count": len(all_debug_names),
+                "names": all_debug_names[:20],
+            }
+        if not fuzzy_candidates:
+            return {
+                "found": False,
+                "ambiguous": False,
+                "index": -1,
+                "text": "",
+                "candidates": [],
+                "count": len(all_debug_names),
+                "names": all_debug_names[:20],
+            }
+
+        # Fallback phase: the full exact scan found no exact item and exactly
+        # one unique fuzzy candidate.  Locate that same candidate again before
+        # clicking because virtual scrolling may have removed its DOM node.
+        unique_candidate = next(iter(fuzzy_candidates.values()))
+        unique_key = _candidate_key(unique_candidate)
+
+        async def _click_unique_if_visible():
+            for candidate in await _scan_visible():
+                if _candidate_key(candidate) == unique_key:
+                    return await _click_candidate(
+                        candidate, "fuzzy-unique", "fuzzy", fuzzy_names
+                    )
+            return None
+
+        clicked = await _click_unique_if_visible()
+        if clicked:
+            return clicked
+
+        await self.page.evaluate(f"""() => {{
+            const list = document.querySelector('{SEL_CONV_LIST}');
+            if (list) {{
+                const scrollable = list.querySelector('[style*="overflow"]') || list;
+                scrollable.scrollTop = 0;
+            }}
+        }}""")
+        await asyncio.sleep(0.5)
+
+        for _ in range(120):
+            clicked = await _click_unique_if_visible()
+            if clicked:
+                return clicked
+            reached_bottom = await self.page.evaluate(f"""() => {{
+                const list = document.querySelector('{SEL_CONV_LIST}');
+                if (!list) return true;
+                const scrollable = list.querySelector('[style*="overflow"]') || list;
+                const before = scrollable.scrollTop;
+                scrollable.scrollTop += 400;
+                return scrollable.scrollTop === before;
+            }}""")
+            await asyncio.sleep(0.4)
+            if reached_bottom:
+                break
+
+        return {
+            "found": False,
+            "ambiguous": False,
+            "index": -1,
+            "text": "",
+            "candidates": fuzzy_names,
+            "count": len(all_debug_names),
+            "names": all_debug_names[:20],
+        }
 
     async def _download_voice_files(self, messages):
         """下载语音消息的音频文件到本地"""
@@ -1076,37 +1237,87 @@ class WebChatScraper:
         conv_name = conv_info["name"]
         # 优先使用纯昵称（不含火花天数和时间）
         clean_name = conv_info.get("nickname") or conv_name
-        # Will try to get real conversation ID from fiber data after clicking
-        conv_id = hashlib.md5(conv_name.encode()).hexdigest()[:16]
+        print(f"  [*] 目标会话: {clean_name}")
 
         # 确保会话列表完整加载（处理上一个会话 reload 后的状态）
         await self._ensure_conv_list_loaded()
 
         result = await self._find_and_click_conversation(clean_name)
+        if result.get("ambiguous"):
+            candidates = result.get("candidates", [])
+            print(f"  [!] 会话匹配存在歧义，已跳过: {clean_name}")
+            for candidate in candidates:
+                print(f"      - {candidate}")
+            return
         if not result.get("found"):
             dbg = result.get("names", [])
             print(f"  [!] 无法找到会话「{clean_name}」，跳过 (DOM中有 {result.get('count', 0)} 个会话: {dbg})")
             return
+        print(f"  [*] 匹配方式: {result.get('match_type', '')}")
         print(f"  [*] 已点击会话: {result.get('text', '')}")
 
         await asyncio.sleep(2)
 
-        active_name = await self.page.evaluate(f"""() => {{
+        active = await self.page.evaluate(f"""() => {{
+            const normalize = s => s.replace(/[\\s\\u00a0]+/g, ' ').trim();
             const active = document.querySelector('{SEL_CONV_ITEM}[class*="curConversation"]');
-            if (!active) return '';
+            if (!active) return {{nickname: '', full_text: ''}};
             const title = active.querySelector('{SEL_CONV_TITLE}');
-            return title ? title.textContent.trim() : '';
+            if (!title) return {{nickname: '', full_text: ''}};
+            const innerTitle = title.querySelector('{SEL_CONV_TITLE}');
+            let nickname = '';
+            if (innerTitle) {{
+                nickname = normalize(innerTitle.textContent);
+            }} else {{
+                for (const node of title.childNodes) {{
+                    const text = node.textContent?.trim();
+                    if (text) {{ nickname = normalize(text); break; }}
+                }}
+            }}
+            return {{
+                nickname,
+                full_text: normalize(title.textContent),
+            }};
         }}""")
-        print(f"  [*] 当前活跃会话: {active_name or '(未检测到)'}")
+        normalize = lambda value: re.sub(r"[\s\u00a0]+", " ", str(value or "")).strip()
+        active = active or {}
+        active_nickname = normalize(active.get("nickname"))
+        active_full_text = normalize(active.get("full_text"))
+        active_name = active_nickname or active_full_text
+        print(f"  [*] 实际活跃会话: {active_name or '(未检测到)'}")
+
+        if result.get("match_type") == "exact" and result.get("matched_by") == "nickname":
+            expected_active = normalize(clean_name)
+            active_matches = active_nickname == expected_active
+        elif result.get("matched_by") == "full-title":
+            expected_active = normalize(clean_name)
+            active_matches = active_full_text == expected_active
+        elif result.get("nickname"):
+            expected_active = normalize(result.get("nickname"))
+            active_matches = active_nickname == expected_active
+        else:
+            expected_active = normalize(result.get("full_text"))
+            active_matches = active_full_text == expected_active
+
+        if not active_matches:
+            print(f"  [!] 会话选择校验失败：目标「{clean_name}」，实际「{active_name or '未检测到'}」")
+            return
 
         # Try to get real conversation ID from IM SDK
         real_conv_id = await self.page.evaluate("""() => {
             const cs = window.conversationStore;
             return cs && cs.curConversationId ? String(cs.curConversationId) : null;
         }""")
-        if real_conv_id:
-            conv_id = real_conv_id
-            print(f"  [*] 真实会话ID: {conv_id}")
+        if not real_conv_id:
+            print(f"  [!] 未获取真实会话ID，已跳过: {clean_name}")
+            return
+
+        conv_id = real_conv_id
+        print(f"  [*] 真实会话ID: {conv_id}")
+        if conv_id in self.processed_conv_ids:
+            print("  [!] 检测到重复会话ID，已跳过重复采集")
+            return
+        self.processed_conv_ids.add(conv_id)
 
         # 全量模式：清除该会话的旧消息，避免残留已撤回或已删除的消息。
         # 但 DELETE 是先 commit 的，而后面的抓取可能一条都拿不到（回退到滚动模式却读不出
