@@ -52,12 +52,14 @@ jobs:
       - run: npm run test --if-present
       - run: npm run build
 
-  # ---- 镜像发布（只在 push main / 打 v* tag 时跑，PR 只测试）----
+  # ---- 镜像发布（仅 canonical 仓库的 main / v* push；fork 只测试）----
   # 两个架构各在原生 runner 上构建、按 digest 推送，最后合并成一个
   # multi-arch manifest。GHCR 用内置 GITHUB_TOKEN 推送，无需额外 secret。
   build-image:
     name: Docker image (${{ matrix.arch }})
-    if: github.event_name == 'push'
+    if: >-
+      github.event_name == 'push' &&
+      github.repository == 'TeamBreakerr/douyin-chat-export'
     needs: [tests, frontend]
     runs-on: ${{ matrix.runner }}
     permissions:
