@@ -65,6 +65,19 @@ def test_build_reply_to():
 
 # ── pure helper functions ──
 
+def test_conversation_export_filename_uses_platform_nickname(monkeypatch):
+    monkeypatch.setattr(exporter, "_export_date", lambda: "2026-08-09")
+
+    assert (
+        exporter.conversation_export_filename("小D", ".json")
+        == "小D_2026-08-09.json"
+    )
+    assert (
+        exporter.conversation_export_filename("平台/昵称", ".jsonl")
+        == "平台_昵称_2026-08-09.jsonl"
+    )
+
+
 def test_decode_sticker_name_from_hex_url():
     # "haha" -> 68616861
     url = "https://p.douyinpic.com/im-resource/123-ts-68616861.png?x=1"
@@ -192,7 +205,8 @@ def test_export_json_format_shape(temp_db, tmp_path):
     assert data["messages"][0]["content"] == "hi"
 
 
-def test_extract_cli_default_uses_id_date_filename(temp_db, tmp_path, monkeypatch):
+def test_extract_cli_default_uses_platform_nickname_date_filename(
+        temp_db, tmp_path, monkeypatch):
     import extract as extract_cli
     import extractor.models as models
     import common.paths as paths
@@ -209,13 +223,13 @@ def test_extract_cli_default_uses_id_date_filename(temp_db, tmp_path, monkeypatc
     extract_cli.run_export({
         "output_format": "jsonl",
         "output_path": None,
-        "name_filter": "CLI会话",
+        "name_filter": "CLI",
     })
 
-    assert (data_dir / "0_1_user_a_2026-08-09.jsonl").is_file()
+    assert (data_dir / "CLI会话_2026-08-09.jsonl").is_file()
 
 
-def test_standalone_export_cli_default_uses_id_date_filename(
+def test_standalone_export_cli_default_uses_platform_nickname_date_filename(
         temp_db, tmp_path, monkeypatch):
     import export as export_cli
     import extractor.models as models
@@ -228,9 +242,9 @@ def test_standalone_export_cli_default_uses_id_date_filename(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(exporter, "_export_date", lambda: "2026-08-09")
     monkeypatch.setattr(
-        sys, "argv", ["export.py", "--filter", "独立CLI会话"]
+        sys, "argv", ["export.py", "--filter", "独立CLI"]
     )
 
     export_cli.main()
 
-    assert (tmp_path / "data" / "conv-42_2026-08-09.jsonl").is_file()
+    assert (tmp_path / "data" / "独立CLI会话_2026-08-09.jsonl").is_file()

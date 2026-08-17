@@ -513,33 +513,39 @@ class _FakeChatLabExporter:
 
     def export(self, path):
         Path(path).write_text("{}", encoding="utf-8")
-        return {"conv_id": self.conv_name or "7670159743629017637"}
+        return {
+            "conv_id": "7670159743629017637",
+            "conv_name": self.conv_name or "平台昵称",
+        }
 
 
-def test_single_export_returns_id_date_file_name(monkeypatch, tmp_path):
+@pytest.mark.parametrize(("fmt", "ext"), [("json", ".json"), ("jsonl", ".jsonl")])
+def test_single_export_returns_platform_nickname_date_file_name(
+        monkeypatch, tmp_path, fmt, ext):
     monkeypatch.setattr(paths, "DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
     monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
-    control_panel._do_export("jsonl", "", None)
+    control_panel._do_export(fmt, "", None)
 
     assert control_panel._export_state["status"] == "completed"
-    assert control_panel._export_state["file_path"] == "7670159743629017637_2026-08-09.jsonl"
+    expected_name = f"平台昵称_2026-08-09{ext}"
+    assert control_panel._export_state["file_path"] == expected_name
     assert not Path(control_panel._export_state["file_path"]).is_absolute()
-    assert (tmp_path / "data" / "7670159743629017637_2026-08-09.jsonl").is_file()
+    assert (tmp_path / "data" / expected_name).is_file()
 
 
-def test_single_export_sanitizes_windows_unsafe_id(monkeypatch, tmp_path):
+def test_single_export_sanitizes_windows_unsafe_nickname(monkeypatch, tmp_path):
     data_dir = tmp_path / "data"
     monkeypatch.setattr(paths, "DATA_DIR", str(data_dir))
     monkeypatch.setattr("extractor.exporter.ChatLabExporter", _FakeChatLabExporter)
     monkeypatch.setattr("extractor.exporter._export_date", lambda: "2026-08-09")
 
-    control_panel._do_export("jsonl", "0:1:user/a", ["0:1:user/a"])
+    control_panel._do_export("jsonl", "平台/昵称", ["平台/昵称"])
 
     assert control_panel._export_state["status"] == "completed"
-    assert control_panel._export_state["file_path"] == "0_1_user_a_2026-08-09.jsonl"
-    assert (data_dir / "0_1_user_a_2026-08-09.jsonl").is_file()
+    assert control_panel._export_state["file_path"] == "平台_昵称_2026-08-09.jsonl"
+    assert (data_dir / "平台_昵称_2026-08-09.jsonl").is_file()
 
 
 def test_multi_export_returns_zip_file_name(monkeypatch, tmp_path):
@@ -578,8 +584,8 @@ def test_multi_export_avoids_colliding_arcnames(monkeypatch, tmp_path):
     assert "A_B_2026-08-09_2.jsonl" in names
     assert "A_B_2026-08-09_3.jsonl" in names
     assert "_CON_2026-08-09.jsonl" in names
-    assert "7670159743629017637_2026-08-09.jsonl" in names
-    assert "7670159743629017637_2026-08-09_2.jsonl" in names
+    assert "平台昵称_2026-08-09.jsonl" in names
+    assert "平台昵称_2026-08-09_2.jsonl" in names
 
 
 def test_multi_export_zip_entries_are_relative_basenames(monkeypatch, tmp_path):

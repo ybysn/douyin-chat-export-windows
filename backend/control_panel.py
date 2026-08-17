@@ -1048,15 +1048,17 @@ def _do_export(fmt: str, filter_name: str, conversations: list | None):
                         conv_name=name, output_format=fmt
                     ).export(path)
                     conv_id = exported.get("conv_id") if isinstance(exported, dict) else None
-                    if os.path.exists(path) and conv_id:
-                        file_name = conversation_export_filename(conv_id, ext)
+                    conv_name = exported.get("conv_name") if isinstance(exported, dict) else None
+                    if os.path.exists(path) and conv_id and conv_name:
+                        file_name = conversation_export_filename(conv_name, ext)
                         arcname = _unique_zip_arcname(
                             file_name[:-len(ext)], ext, used_arcnames
                         )
                         produced.append((name, path, arcname))
                     elif os.path.exists(path):
                         os.remove(path)
-                        print(f"[-] 导出 {name} 失败: 导出结果缺少真实会话 ID")
+                        missing = "真实会话 ID" if not conv_id else "平台昵称"
+                        print(f"[-] 导出 {name} 失败: 导出结果缺少{missing}")
                 except Exception as e:
                     print(f"[-] 导出 {name} 失败: {e}")
 

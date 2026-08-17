@@ -35,17 +35,17 @@ def _export_date() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
-def conversation_export_filename(conv_id: str, ext: str) -> str:
-    """Build a Windows-safe ``id_date.ext`` export filename."""
-    safe_id = re.sub(r"[^\w.-]+", "_", str(conv_id or ""), flags=re.UNICODE)
-    safe_id = safe_id.strip(" .")[:160] or "conv"
-    if safe_id.upper() in _WINDOWS_RESERVED_NAMES:
-        safe_id = f"_{safe_id}"
-    return f"{safe_id}_{_export_date()}{ext}"
+def conversation_export_filename(conv_name: str, ext: str) -> str:
+    """Build a Windows-safe ``platform_nickname_date.ext`` export filename."""
+    safe_name = re.sub(r"[^\w.-]+", "_", str(conv_name or ""), flags=re.UNICODE)
+    safe_name = safe_name.strip(" .")[:160] or "conv"
+    if safe_name.upper() in _WINDOWS_RESERVED_NAMES:
+        safe_name = f"_{safe_name}"
+    return f"{safe_name}_{_export_date()}{ext}"
 
 
 def export_to_generated_path(exporter, output_dir: str, ext: str):
-    """Export via a temporary file, then rename it from the real conversation ID."""
+    """Export via a temporary file, then rename it from the platform nickname."""
     os.makedirs(output_dir, exist_ok=True)
     temporary_path = os.path.join(output_dir, f".exporting{ext}")
     if os.path.exists(temporary_path):
@@ -60,8 +60,13 @@ def export_to_generated_path(exporter, output_dir: str, ext: str):
         os.remove(temporary_path)
         raise RuntimeError("导出结果缺少真实会话 ID")
 
+    conv_name = exported.get("conv_name") if isinstance(exported, dict) else None
+    if not conv_name:
+        os.remove(temporary_path)
+        raise RuntimeError("导出结果缺少平台昵称")
+
     output_path = os.path.join(
-        output_dir, conversation_export_filename(conv_id, ext)
+        output_dir, conversation_export_filename(conv_name, ext)
     )
     os.replace(temporary_path, output_path)
     return output_path, exported
